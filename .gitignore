@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# Conda environments
+env/
+venv/
+*.egg-info/
+
+# Database — keep local only
+*.db
+*.sqlite
+*.sqlite3
+
+# JSON memory files — keep local only
+memory/*.json
+*.json
+
+# Model files — too large for GitHub
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.gguf
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.cursor
+```
+
+The most important lines:
+```
+*.db          ← chisato.db never goes to GitHub
+memory/*.json ← your personal memory files stay local
+*.pth         ← voice model files are too large
+*.gguf        ← LLM model files are massive
+
+# GPT-SoVITS — has its own git repo, exclude entirely
+Chisato/backend/voice/GPT-SOVITS/
