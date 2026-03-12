@@ -1,62 +1,49 @@
 """
-Persistence and lightweight memory utilities for Chisato.
+Chisato Memory Store — memorynew.py (SQLite Final)
 
-The store keeps a JSON document on disk and offers helpers for recording
-turns, promoting summaries to long-term memory, updating the profile,
-and retrieving memory intelligently to allow dynamic conversation topics.
+All JSON references removed.
+All reads/writes go through chisato.db via db.py.
 """
 from __future__ import annotations
-import json
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, Iterable, List
-import re
 
-DEFAULT_MEMORY: Dict[str, Any] = {
-    "profile": {"name": "", "likes": [], "dislikes": [], "goals": []},
-    "long_term": [],
-    "short_term": [],
-}
+import json
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional
+
+from memory.db import get_db
+
 
 class MemoryStore:
-    def __init__(self, path: Path, max_short_term: int = 20) -> None:
-        self.path = Path(path)
+    def __init__(self, path=None, max_short_term: int = 20) -> None:
+        # path kept for backward compatibility — no longer used
         self.max_short_term = max_short_term
-        self.data: Dict[str, Any] = {}
-        self._ensure_file()
+        self.db = get_db()
+        self._refresh_cache()
 
-    # ---------------- File Operations ---------------- #
-    def _ensure_file(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self.data = json.loads(json.dumps(DEFAULT_MEMORY))
-            self.save()
-        else:
-            self.load()
-
-    def load(self) -> Dict[str, Any]:
-        with self.path.open("r", encoding="utf-8") as handle:
-            self.data = json.load(handle)
-        return self.data
+    def _refresh_cache(self) -> None:
+        """Pull current state from DB into self.data cache."""
+        self.data: Dict[str, Any] = {
+            "profile":    self.db.get_profile(),
+            "long_term":  self.db.get_long_term(n=100),
+            "short_term": self.db.get_short_term(n=self.max_short_term),
+        }
 
     def save(self) -> None:
-        with self.path.open("w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, ensure_ascii=False, indent=2)
+        """No-op — SQLite writes on every operation automatically."""
+        pass
 
     def snapshot(self) -> Dict[str, Any]:
-        return json.loads(json.dumps(self.data))
+        self._refresh_cache()
+        return self.data
 
-    # ---------------- Short-Term Memory ---------------- #
+    # ── Short term memory ─────────────────────────────────────────────────────
     def record_turn(self, user: str, assistant: str) -> None:
-        """Record a conversation turn - filters out system messages and commands."""
-        # Skip empty messages
+        """Record a conversation turn — filters system commands and empty input."""
         if not user or not user.strip():
             return
-            
-        # Filter out system commands and file paths
+
         user_lower = user.strip().lower()
-        
-        # Skip if it looks like a file path or system command
         if any([
             user.strip().startswith('"C:\\'),
             user.strip().startswith('C:\\'),
@@ -68,46 +55,43 @@ class MemoryStore:
             user.strip().startswith('\\'),
         ]):
             return
-        
-        entry = {
-            "user": user,
-            "assistant": assistant,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-        self.add_short_term(entry)
+
+        self.db.add_short_term(user.strip(), assistant.strip())
+        self.db.trim_short_term(self.max_short_term)
+        self._refresh_cache()
 
     def add_short_term(self, entry: Any) -> None:
-        self.data.setdefault("short_term", []).append(entry)
-        if len(self.data["short_term"]) > self.max_short_term:
-            overflow = len(self.data["short_term"]) - self.max_short_term
-            self.data["short_term"] = self.data["short_term"][overflow:]
-        self.save()
+        """Legacy support — entry is dict with user/assistant keys."""
+        if isinstance(entry, dict):
+            user_msg    = entry.get("user", "")
+            chisato_msg = entry.get("assistant", "")
+            if user_msg and chisato_msg:
+                self.db.add_short_term(user_msg, chisato_msg)
+                self.db.trim_short_term(self.max_short_term)
+                self._refresh_cache()
 
-    # ---------------- Long-Term Memory ---------------- #
+    # ── Long term memory ──────────────────────────────────────────────────────
     def add_long_term(self, summary: str) -> None:
-        """Add a memory to long-term storage, avoiding duplicates."""
-        self.data.setdefault("long_term", [])
-        # Normalize for comparison
+        """Add to long-term memory, avoiding duplicates."""
         summary_clean = summary.strip()
         if not summary_clean:
             return
-        # Check for duplicates (case-insensitive)
-        existing_lower = [m.lower() for m in self.data["long_term"]]
-        if summary_clean.lower() not in existing_lower:
-            self.data["long_term"].append(summary_clean)
-            self.save()
+        self.db.add_long_term(summary_clean)
+        self._refresh_cache()
 
     def promote_short_to_long_term(self, llm=None, n: int = 5) -> None:
         """
-        Promote the most important recent short-term conversations to long-term memory.
-        Uses LLM to intelligently decide what's important to remember.
+        Promote important recent short-term turns to long-term memory.
+        Uses LLM to decide what's worth keeping.
         """
-        recent_entries = self.data.get("short_term", [])[-n:]
+        # Always fetch fresh from DB — not stale cache
+        recent_entries = self.db.get_short_term(n=n)
         if not recent_entries:
             return
 
+        # DB returns user_msg / chisato_msg — correct column names
         text_block = "\n".join([
-            f"User: {e['user']}\nChisato: {e['assistant']}" 
+            f"User: {e['user_msg']}\nChisato: {e['chisato_msg']}"
             for e in recent_entries
         ])
 
@@ -118,107 +102,83 @@ Recent conversation:
 {text_block}
 
 Rules:
-- Only extract facts about the USER (not about you/Chisato)
-- Only include things that would be useful to remember in future conversations
+- Only extract facts about the USER (not about Chisato)
+- Only include things useful to remember in future conversations
 - Each fact should be ONE short sentence
-- Examples of good facts: "User's name is John", "User loves anime", "User is learning Python"
-- Examples of bad facts: Generic statements, your own responses, temporary context
+- Examples of good facts: "User's name is Firdaus", "User loves anime"
+- Examples of bad facts: Generic statements, Chisato's own responses
 - Return ONLY the facts, one per line
-- If nothing important to remember, return "NONE"
+- If nothing important, return "NONE"
 
 Important facts to remember:"""
 
             try:
                 response = llm.chat([{"role": "user", "content": prompt}])
-                result = response.text.strip()
-                
+                result   = response.text.strip()
+
                 if result and result.upper() != "NONE":
-                    lines = result.split("\n")
-                    for line in lines:
+                    for line in result.split("\n"):
                         clean = line.strip().lstrip("-•*").strip()
-                        if clean and len(clean) > 5:  # Ignore very short lines
+                        if clean and len(clean) > 5:
                             self.add_long_term(clean)
             except Exception as e:
                 print(f"[Memory] Error promoting to long-term: {e}")
-                pass
 
-    # ---------------- Profile ---------------- #
+    # ── Profile ───────────────────────────────────────────────────────────────
     def update_profile(
         self,
-        name: str | None = None,
-        likes: Iterable[str] | None = None,
-        dislikes: Iterable[str] | None = None,
-        goals: Iterable[str] | None = None,
+        name: Optional[str]     = None,
+        likes: Iterable[str]    = None,
+        dislikes: Iterable[str] = None,
+        goals: Iterable[str]    = None,
     ) -> None:
-        """Update user profile with new information."""
-        profile = self.data.setdefault("profile", {})
-        
         if name:
-            profile["name"] = name
+            self.db.save_profile_name(name)
             self.add_long_term(f"User's name is {name}")
             print(f"[Memory] Saved name: {name}")
 
-        def _extend(key: str, values: Iterable[str] | None) -> None:
-            if not values:
-                return
-            profile.setdefault(key, [])
-            existing = {str(v).lower() for v in profile[key]}
-            for v in values:
-                v_str = str(v).strip()
-                if v_str and v_str.lower() not in existing:
-                    profile[key].append(v_str)
-                    existing.add(v_str.lower())
+        if likes:
+            for v in likes:
+                if str(v).strip():
+                    self.db.add_trait("like", str(v).strip())
 
-        _extend("likes", likes)
-        _extend("dislikes", dislikes)
-        _extend("goals", goals)
-        self.save()
+        if dislikes:
+            for v in dislikes:
+                if str(v).strip():
+                    self.db.add_trait("dislike", str(v).strip())
 
-    # ---------------- Memory Extraction ---------------- #
-    def extract_new_memory(self, text: str) -> str:
-        """Fallback memory extraction if LLM is unavailable."""
-        sentences = text.strip().split(".")
-        candidate = ".".join(sentences[:2]).strip()
-        return candidate if candidate else text.strip()[:280]
+        if goals:
+            for v in goals:
+                if str(v).strip():
+                    self.db.add_trait("goal", str(v).strip())
 
-    # ---------------- Helpers ---------------- #
-    def get_memory_for_prompt(self, n: int = 5) -> dict:
-        """Get recent memory formatted for prompt context."""
-        short_mem = self.data.get("short_term", [])[-n:]
-        long_mem = self.data.get("long_term", [])
-        profile = self.data.get("profile", {})
-        
-        return {
-            "profile": profile,
-            "long_term": long_mem,
-            "recent_conversation": short_mem
-        }
+        self._refresh_cache()
 
-    # ---------------- Intelligent Name Detection ---------------- #
-    def detect_and_save_user_info(self, user_input: str, assistant_response: str, llm=None) -> None:
-        """
-        Intelligently detect if user is sharing personal information (name, likes, etc.)
-        and save it appropriately.
-        """
+    # ── Memory for prompt ─────────────────────────────────────────────────────
+    def get_memory_for_prompt(self, n: int = 5) -> Dict:
+        """Returns memory dict for prompt injection."""
+        return self.db.get_memory_for_prompt(n=n)
+
+    # ── User info detection ───────────────────────────────────────────────────
+    def detect_and_save_user_info(
+        self, user_input: str, assistant_response: str, llm=None
+    ) -> None:
         if not user_input or not user_input.strip():
             return
-
-        # Skip if it's a system command
         if self._is_system_command(user_input):
             return
 
-        # Try simple name detection first
+        # Simple name detection first
         name = self._detect_name_simple(user_input)
-        if name and not self.data.get("profile", {}).get("name"):
+        if name and not self.db.get_profile().get("name"):
             self.update_profile(name=name)
             return
 
-        # Use LLM for more intelligent detection if available
+        # LLM-based detection
         if llm:
             self._detect_info_with_llm(user_input, assistant_response, llm)
 
     def _is_system_command(self, text: str) -> bool:
-        """Check if text is a system command or file path."""
         text_lower = text.strip().lower()
         return any([
             text.strip().startswith('"C:\\'),
@@ -229,8 +189,7 @@ Important facts to remember:"""
             text.strip().startswith('\\'),
         ])
 
-    def _detect_name_simple(self, user_input: str) -> str | None:
-        """Simple regex-based name detection."""
+    def _detect_name_simple(self, user_input: str) -> Optional[str]:
         patterns = [
             r"\bmy name is (\w+)\b",
             r"\bi am (\w+)\b",
@@ -240,22 +199,20 @@ Important facts to remember:"""
             r"\bthis is (\w+)\b",
             r"\bname'?s (\w+)\b",
         ]
-        
+        common_words = {'the', 'this', 'that', 'your', 'my', 'his', 'her'}
         for pat in patterns:
             match = re.search(pat, user_input, re.IGNORECASE)
             if match:
                 name = match.group(1).capitalize()
-                # Filter out common words that aren't names
-                common_words = {'the', 'this', 'that', 'your', 'my', 'his', 'her'}
                 if name.lower() not in common_words:
                     return name
-        
         return None
 
-    def _detect_info_with_llm(self, user_input: str, assistant_response: str, llm) -> None:
-        """Use LLM to detect personal information in conversation."""
+    def _detect_info_with_llm(
+        self, user_input: str, assistant_response: str, llm
+    ) -> None:
         try:
-            prompt = f"""Analyze this conversation turn and extract any personal information about the user.
+            prompt = f"""Analyze this conversation turn and extract personal information about the user.
 
 User said: "{user_input}"
 Assistant replied: "{assistant_response}"
@@ -268,35 +225,36 @@ Extract and format as JSON:
   "goals": ["their goals or plans"]
 }}
 
-Only include information explicitly stated by the user. If nothing found, return empty arrays/null.
-Return ONLY the JSON, no other text."""
+Only include information explicitly stated by the user.
+Return ONLY the JSON, nothing else."""
 
-            response = llm.chat([{"role": "user", "content": prompt}])
+            response    = llm.chat([{"role": "user", "content": prompt}])
             result_text = response.text.strip()
-            
-            # Try to extract JSON from response
+
+            # Parse JSON from response
             json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
             if json_match:
                 info = json.loads(json_match.group())
-                
-                # Update profile with detected information
-                if info.get("name") and not self.data.get("profile", {}).get("name"):
+
+                if info.get("name") and not self.db.get_profile().get("name"):
                     self.update_profile(name=info["name"])
-                
                 if info.get("likes"):
                     self.update_profile(likes=info["likes"])
-                
                 if info.get("dislikes"):
                     self.update_profile(dislikes=info["dislikes"])
-                
                 if info.get("goals"):
                     self.update_profile(goals=info["goals"])
-                    
+
         except Exception as e:
             print(f"[Memory] Info detection error: {e}")
-            pass
 
-    # Deprecated - keeping for backward compatibility
-    def detect_user_name(self, user_input: str, llm=None) -> str | None:
-        """Deprecated: Use detect_and_save_user_info instead."""
+    # ── Legacy ────────────────────────────────────────────────────────────────
+    def extract_new_memory(self, text: str) -> str:
+        """Fallback memory extraction if LLM unavailable."""
+        sentences = text.strip().split(".")
+        candidate = ".".join(sentences[:2]).strip()
+        return candidate if candidate else text.strip()[:280]
+
+    def detect_user_name(self, user_input: str, llm=None) -> Optional[str]:
+        """Deprecated — use detect_and_save_user_info instead."""
         return self._detect_name_simple(user_input)

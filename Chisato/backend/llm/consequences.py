@@ -22,12 +22,11 @@ The Jarvis principle:
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from memory.db import get_db
 
 # ── Data structures ───────────────────────────────────────────────────────────
 
@@ -75,8 +74,10 @@ class GrowthMoment:
 
 
 class ConsequenceSystem:
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, path=None) -> None:
+        # path kept for backward compatibility; storage is now SQLite via ChisatoDB
+        self.path = path
+        self.db = get_db()
         self.dismissed_warnings: List[DismissedWarning] = []
         self.patterns: Dict[str, BehaviorPattern] = {}
         self.growth_moments: List[GrowthMoment] = []
@@ -84,33 +85,50 @@ class ConsequenceSystem:
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def _load(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self._save()
-            return
-        with self.path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        # Dismissed warnings, patterns, and growth moments live in dedicated tables.
+        self.dismissed_warnings = []
+        for w in self.db.get_unresolved_warnings():
+            self.dismissed_warnings.append(
+                DismissedWarning(
+                    topic=w["topic"],
+                    warning=w["warning"],
+                    dismissed_at=w["dismissed_at"],
+                    was_right=w.get("was_right"),
+                    outcome_note=w.get("outcome_note", ""),
+                    surfaced_count=w.get("surfaced_count", 0),
+                    resolved=bool(w["resolved"]),
+                )
+            )
 
-        self.dismissed_warnings = [
-            DismissedWarning(**w) for w in data.get("dismissed_warnings", [])
-        ]
-        self.patterns = {
-            k: BehaviorPattern(**v)
-            for k, v in data.get("patterns", {}).items()
-        }
-        self.growth_moments = [
-            GrowthMoment(**g) for g in data.get("growth_moments", [])
-        ]
+        self.patterns = self.db.get_behavior_patterns()
+
+        self.growth_moments = []
+        for g in self.db.get_growth_moments():
+            self.growth_moments.append(
+                GrowthMoment(
+                    topic=g["topic"],
+                    what_changed=g["what_changed"],
+                    original_stance=g["original_stance"],
+                    new_stance=g["new_stance"],
+                    noticed_at=g["noticed_at"],
+                    acknowledged=bool(g["acknowledged"]),
+                )
+            )
 
     def _save(self) -> None:
-        data = {
-            "dismissed_warnings": [vars(w) for w in self.dismissed_warnings],
-            "patterns":           {k: vars(v) for k, v in self.patterns.items()},
-            "growth_moments":     [vars(g) for g in self.growth_moments],
-            "last_updated":       datetime.now(timezone.utc).isoformat(),
-        }
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # Push local cached structures back into DB as needed.
+        # Dismissed warnings
+        for w in self.dismissed_warnings:
+            if w.was_right is None and not w.resolved:
+                # creation handled when recorded; skip here
+                continue
+            # if outcome known or resolved, update via db
+            was_right = w.was_right if w.was_right is not None else False
+            self.db.update_warning_outcome(
+                warning_id=w.surfaced_count or 0,
+                was_right=was_right,
+                outcome_note=w.outcome_note,
+            )
 
     # ── Dismissed Warnings ────────────────────────────────────────────────────
     def record_warning_dismissed(

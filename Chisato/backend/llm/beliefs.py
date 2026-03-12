@@ -13,11 +13,11 @@ so the LLM always has something real to perform from — not a blank slate.
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from memory.db import get_db
 
 
 # ── Tier 1 — Core Beliefs (Never change) ─────────────────────────────────────
@@ -126,8 +126,10 @@ class LivePosition:
 
 
 class BeliefSystem:
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, path=None) -> None:
+        # path kept for backward compatibility; storage is now SQLite via ChisatoDB
+        self.path = path
+        self.db = get_db()
         self.tier1 = TIER1_CORE_BELIEFS
         self.tier2: Dict[str, Any] = {}
         self.tier3: Dict[str, LivePosition] = {}
@@ -135,29 +137,72 @@ class BeliefSystem:
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def _load(self) -> None:
-        """Load tier2 and tier3 from disk. Tier1 is always hardcoded."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self.tier2 = json.loads(json.dumps(DEFAULT_TIER2_OPINIONS))
-            self.tier3 = {}
-            self._save()
+        """Load tier2 and tier3 from SQLite via db.py. Tier1 is always hardcoded."""
+        # Tier 2 — authored opinions live in beliefs_tier2
+        db_tier2 = self.db.get_beliefs_tier2()
+        if db_tier2:
+            # convert DB format into the structure this class expects
+            self.tier2 = {}
+            for key, row in db_tier2.items():
+                self.tier2[key] = {
+                    "summary": row.get("summary", ""),
+                    "confidence": row.get("confidence", 0.0),
+                    "evidence": row.get("evidence", []),
+                    "open_questions": row.get("open_questions", []),
+                    "last_updated": row.get("updated_at"),
+                }
         else:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.tier2 = data.get("tier2", json.loads(json.dumps(DEFAULT_TIER2_OPINIONS)))
-            # Rebuild LivePosition objects from stored dicts
-            raw_tier3 = data.get("tier3", {})
-            self.tier3 = {
-                k: LivePosition(**v) for k, v in raw_tier3.items()
-            }
+            # seed defaults into DB on first load
+            self.tier2 = DEFAULT_TIER2_OPINIONS.copy()
+            for key, opinion in self.tier2.items():
+                self.db.save_belief_tier2(
+                    key=key,
+                    summary=opinion["summary"],
+                    confidence=opinion["confidence"],
+                    evidence=opinion["evidence"],
+                    open_questions=opinion["open_questions"],
+                )
+
+        # Tier 3 — live positions in beliefs_tier3
+        db_tier3 = self.db.get_beliefs_tier3()
+        self.tier3 = {
+            topic: LivePosition(
+                topic=topic,
+                position=row["position"],
+                strength=row["strength"],
+                formed_from=row["formed_from"],
+                times_challenged=row["times_challenged"],
+                times_held=row["times_held"],
+                times_updated=row["times_updated"],
+                formed_at=row["formed_at"],
+            )
+            for topic, row in db_tier3.items()
+        }
 
     def _save(self) -> None:
-        data = {
-            "tier2": self.tier2,
-            "tier3": {k: vars(v) for k, v in self.tier3.items()},
-        }
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        """Persist current tier2 and tier3 state back to SQLite."""
+        # Tier2
+        for key, opinion in self.tier2.items():
+            self.db.save_belief_tier2(
+                key=key,
+                summary=opinion.get("summary", ""),
+                confidence=opinion.get("confidence", 0.0),
+                evidence=opinion.get("evidence", []),
+                open_questions=opinion.get("open_questions", []),
+            )
+
+        # Tier3
+        for topic, pos in self.tier3.items():
+            self.db.save_belief_tier3(
+                topic=topic,
+                position=pos.position,
+                strength=pos.strength,
+                formed_from=pos.formed_from,
+                times_challenged=pos.times_challenged,
+                times_held=pos.times_held,
+                times_updated=pos.times_updated,
+                formed_at=pos.formed_at,
+            )
 
     # ── Tier 2 operations ─────────────────────────────────────────────────────
     def add_tier2_evidence(self, opinion_key: str, evidence: str) -> None:

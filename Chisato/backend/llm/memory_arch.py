@@ -25,12 +25,11 @@ Significance filter — what Chisato actually notices:
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from memory.db import get_db
 
 # ── Significance filter ───────────────────────────────────────────────────────
 # What Chisato notices and considers worth remembering as an episode.
@@ -107,8 +106,10 @@ class RelationshipState:
 
 
 class MemoryArchitecture:
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, path=None) -> None:
+        # path kept for backward compatibility; storage is now SQLite via ChisatoDB
+        self.path = path
+        self.db = get_db()
         self.episodes: List[Episode] = []
         self.relationship = RelationshipState()
         self._load()
@@ -116,25 +117,44 @@ class MemoryArchitecture:
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def _load(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self._save()
-            return
-        with self.path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.episodes = [Episode(**e) for e in data.get("episodes", [])]
-        rel_data = data.get("relationship", {})
-        if rel_data:
-            self.relationship = RelationshipState(**rel_data)
+        # Episodes from DB
+        raw_eps = self.db.get_episodes(limit=1000)
+        self.episodes = [
+            Episode(
+                title=e["title"],
+                what_happened=e["what_happened"],
+                why_it_mattered=e["why_it_mattered"],
+                emotional_tone=e["emotional_tone"],
+                category=e["category"],
+                timestamp=e["timestamp"],
+                referenced_count=e["referenced_count"],
+                still_relevant=bool(e["still_relevant"]),
+            )
+            for e in raw_eps
+        ]
+
+        # Relationship state from DB
+        rel = self.db.get_relationship()
+        if rel:
+            self.relationship = RelationshipState(
+                phase=rel.get("phase", "early"),
+                started_as=rel.get("started_as", "a technical project"),
+                has_become=rel.get("has_become", ""),
+                defining_moments=rel.get("defining_moments", []),
+                current_dynamic=rel.get("current_dynamic", ""),
+                last_updated=rel.get("updated_at", ""),
+            )
 
     def _save(self) -> None:
-        data = {
-            "episodes":     [vars(e) for e in self.episodes],
-            "relationship": vars(self.relationship),
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-        }
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # Episodes: write only new ones via add_episode and referenced_count via increment
+        # Relationship: save single row
+        self.db.save_relationship(
+            phase=self.relationship.phase,
+            started_as=self.relationship.started_as,
+            has_become=self.relationship.has_become,
+            defining_moments=self.relationship.defining_moments,
+            current_dynamic=self.relationship.current_dynamic,
+        )
 
     def _initialize_relationship_if_empty(self) -> None:
         """

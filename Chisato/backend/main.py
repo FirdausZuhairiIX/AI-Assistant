@@ -1,26 +1,11 @@
 """
-Chisato AI Companion — main.py (Final)
+Chisato AI Companion — main.py (SQLite Final)
 
-Wires all six pillars into a single conversation loop.
-
-Pillars initialized:
-  1. BeliefSystem       — her convictions, live positions
-  2. PressureSystem     — emotional pressure meters
-  3. ConsequenceSystem  — dismissed warnings, patterns, growth
-  4. MemoryArchitecture — episodes, relationship state
-  5. InitiativeSystem   — curiosity, observations, opinions
-  6. ConsistencyEngine  — drift detection, validation, anchoring
-
-Plus existing:
-  - MemoryStore    (memorynew.py) — short/long term facts, profile
-  - EmotionTracker (emotion.py)  — current turn emotion state
-  - LLMClient      (model.py)    — Ollama wrapper
-
-TTS / STT / Avatar hooks marked as TODO placeholders.
+All JSON file references removed.
+All pillars connect directly to chisato.db via db.py.
 """
 from __future__ import annotations
 
-import json
 import random
 import sys
 from pathlib import Path
@@ -31,25 +16,25 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.append(str(CURRENT_DIR))
 
 # ── Core ──────────────────────────────────────────────────────────────────────
-from llm.model       import LLMClient, LLMResponse
-from llm.prompts     import build_chat_messages, validate_response
+from llm.model        import LLMClient, LLMResponse
+from llm.prompts      import build_chat_messages, validate_response
 from memory.memorynew import MemoryStore
 
 # ── Pillars ───────────────────────────────────────────────────────────────────
-from llm.emotion       import EmotionTracker
-from llm.beliefs       import BeliefSystem
-from llm.pressure      import PressureSystem
-from llm.consequences  import ConsequenceSystem
-from llm.memory_arch   import MemoryArchitecture
-from llm.initiative    import InitiativeSystem
-from llm.consistency   import ConsistencyEngine
+from llm.emotion      import EmotionTracker
+from llm.beliefs      import BeliefSystem
+from llm.pressure     import PressureSystem
+from llm.consequences import ConsequenceSystem
+from llm.memory_arch  import MemoryArchitecture
+from llm.initiative   import InitiativeSystem
+from llm.consistency  import ConsistencyEngine
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MAX_HISTORY          = 12
-MAX_SHORT_TERM       = 20
+MAX_HISTORY          = 20
+MAX_SHORT_TERM       = 50
 MEMORY_PROMOTE_EVERY = 4
-MAX_RETRIES          = 2      # how many times to retry on hard character break
+MAX_RETRIES          = 2
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -65,8 +50,6 @@ def load_persona(path: Path) -> str:
 
 def print_response(response: LLMResponse) -> None:
     print(f"\nChisato: {response.text}")
-    if response.tool_calls:
-        print(f"[DEBUG tool] {json.dumps(response.tool_calls, ensure_ascii=False)}")
 
 
 def print_debug(
@@ -84,35 +67,28 @@ def print_debug(
     print("DEBUG SNAPSHOT")
     print("=" * 60)
 
-    # Emotion
     e = emotion.get_state()
     print(f"Emotion     : {e.current} ({e.intensity:.2f}) — {e.trigger}")
 
-    # Pressure
     ps = pressure.summary()
     print(f"Pressure    : {ps}")
 
-    # Beliefs
     tier3 = beliefs.tier3
     print(f"Live positions: {len(tier3)}")
     for topic, pos in list(tier3.items())[:3]:
         print(f"  [{topic}] {pos.position[:60]}... (strength {pos.strength:.2f})")
 
-    # Consequences
     cs = consequences.summary()
     print(f"Consequences: {cs}")
 
-    # Memory arch
     ms = memory_arch.summary()
     print(f"Episodes    : {ms['total_episodes']} total, "
           f"phase={ms['relationship_phase']}")
 
-    # Initiative
     ins = initiative.summary()
     print(f"Initiative  : {ins['total_initiatives']} total, "
           f"{ins['turns_since_last']} turns since last")
 
-    # Consistency
     con = consistency.summary()
     print(f"Consistency : {con['consecutive_clean']} clean turns, "
           f"hard breaks={con['total_hard_breaks']}, "
@@ -127,20 +103,24 @@ def print_memory_snapshot(memory_store: MemoryStore) -> None:
     print("\n" + "=" * 60)
     print("MEMORY SNAPSHOT")
     print("=" * 60)
-    data = memory_store.snapshot()
+    data    = memory_store.snapshot()
     profile = data.get("profile", {})
+
     if profile.get("name"):
         print(f"Name    : {profile['name']}")
     if profile.get("likes"):
         print(f"Likes   : {', '.join(profile['likes'])}")
     if profile.get("goals"):
         print(f"Goals   : {'; '.join(profile['goals'])}")
+
     long_term = data.get("long_term", [])
     if long_term:
         print(f"\nLong-term ({len(long_term)}):")
         for i, m in enumerate(long_term[-8:], 1):
             print(f"  {i}. {m}")
-    print(f"\nShort-term: {len(data.get('short_term', []))} entries")
+
+    short_term = data.get("short_term", [])
+    print(f"\nShort-term: {len(short_term)} entries")
     print("=" * 60)
 
 
@@ -148,20 +128,19 @@ def print_memory_snapshot(memory_store: MemoryStore) -> None:
 def main() -> None:
     repo_root    = CURRENT_DIR.parent
     persona_path = repo_root / "data" / "persona.md"
-    memory_dir   = CURRENT_DIR / "memory"
 
-    # ── Load persona ──────────────────────────────────────────────────────────
     persona = load_persona(persona_path)
 
     # ── Initialize all pillars ────────────────────────────────────────────────
-    memory_store  = MemoryStore(memory_dir / "memory.json",      max_short_term=MAX_SHORT_TERM)
+    # No file paths — all pillars use get_db() internally
+    memory_store  = MemoryStore(max_short_term=MAX_SHORT_TERM)
     emotion       = EmotionTracker()
-    beliefs       = BeliefSystem(memory_dir      / "beliefs.json")
-    pressure      = PressureSystem(memory_dir    / "pressure.json")
-    consequences  = ConsequenceSystem(memory_dir / "consequences.json")
-    memory_arch   = MemoryArchitecture(memory_dir / "memory_arch.json")
-    initiative    = InitiativeSystem(memory_dir  / "initiative.json")
-    consistency   = ConsistencyEngine(memory_dir / "consistency.json")
+    beliefs       = BeliefSystem()
+    pressure      = PressureSystem()
+    consequences  = ConsequenceSystem()
+    memory_arch   = MemoryArchitecture()
+    initiative    = InitiativeSystem()
+    consistency   = ConsistencyEngine()
     llm_client    = LLMClient()
 
     history:             List[Dict[str, str]] = []
@@ -266,7 +245,6 @@ def main() -> None:
                 break
 
             if attempt < MAX_RETRIES:
-                # Inject hard break anchor and retry
                 print(f"[WARN] Character break: {reason} — retrying ({attempt + 1}/{MAX_RETRIES})")
                 anchor = consistency.get_hard_break_anchor()
                 messages_with_anchor = messages.copy()
@@ -276,7 +254,7 @@ def main() -> None:
                 })
                 messages = messages_with_anchor
             else:
-                print(f"[WARN] Could not recover from character break after {MAX_RETRIES} retries")
+                print(f"[WARN] Could not recover after {MAX_RETRIES} retries")
 
         if response is None:
             continue
@@ -290,24 +268,21 @@ def main() -> None:
 
         # ── Avatar hook ───────────────────────────────────────────────────────
         # TODO: Send emotion + pressure state to Unity/VRoid
-        # emotion_state = emotion.get_state()
+        # emotion_state  = emotion.get_state()
         # pressure_state = pressure.summary()
-        # avatar_client.animate(emotion_state, pressure_state, audio_data)
+        # avatar_client.animate(emotion_state, pressure_state)
 
         # ── Update all pillars ────────────────────────────────────────────────
         emotion.update(user_input, response.text)
         pressure.update(user_input, response.text)
         initiative.update(user_input, response.text)
 
-        # Memory architecture — she decides what becomes an episode
         current_emotion = emotion.get_state().current
         memory_arch.process_turn(user_input, response.text, current_emotion)
 
-        # Memory store
         memory_store.record_turn(user_input, response.text)
         memory_store.detect_and_save_user_info(user_input, response.text, llm_client)
 
-        # History
         history.append({"role": "user",      "content": user_input})
         history.append({"role": "assistant",  "content": response.text})
         if len(history) > MAX_HISTORY * 2:
@@ -316,15 +291,9 @@ def main() -> None:
         turn_count          += 1
         memory_turn_counter += 1
 
-        # Periodic long-term memory promotion
         if memory_turn_counter >= MEMORY_PROMOTE_EVERY and random.random() > 0.4:
-            memory_store.promote_short_to_long_term(llm=llm_client, n=5)
+            memory_store.promote_short_to_long_term(llm=llm_client, n=10)
             memory_turn_counter = 0
-
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-    print("\n[Saving...]")
-    memory_store.save()
-    print("[Done]")
 
 
 if __name__ == "__main__":

@@ -23,13 +23,12 @@ The difference from random thought injection (prompts.py CHISATO_THOUGHTS):
 """
 from __future__ import annotations
 
-import json
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from memory.db import get_db
 
 # ── Curiosity pools ───────────────────────────────────────────────────────────
 # Things Chisato is genuinely curious about.
@@ -143,8 +142,10 @@ class InitiativeRecord:
 
 
 class InitiativeSystem:
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, path=None) -> None:
+        # path kept for backward compatibility; storage is now SQLite via ChisatoDB
+        self.path = path
+        self.db = get_db()
         self.history: List[InitiativeRecord] = []
         self.turn_counter: int = 0
         self.turns_since_initiative: int = 0
@@ -153,27 +154,24 @@ class InitiativeSystem:
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def _load(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self._save()
-            return
-        with self.path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.history = [InitiativeRecord(**r) for r in data.get("history", [])]
-        self.turn_counter = data.get("turn_counter", 0)
-        self.turns_since_initiative = data.get("turns_since_initiative", 0)
-        self._observation_trigger_counts = data.get("trigger_counts", {})
+        # Initiative history lives in initiative_history table
+        raw = self.db.get_recent_initiatives(n=100)
+        self.history = [
+            InitiativeRecord(
+                initiative_type=r["initiative_type"],
+                content=r["content"],
+                turn_taken=r["turn_taken"],
+                timestamp=r["timestamp"],
+            )
+            for r in raw
+        ]
+        self.turn_counter = self.db.get_last_initiative_turn()
+        self.turns_since_initiative = 0
+        self._observation_trigger_counts = {}
 
     def _save(self) -> None:
-        data = {
-            "history":              [vars(r) for r in self.history[-50:]],
-            "turn_counter":         self.turn_counter,
-            "turns_since_initiative": self.turns_since_initiative,
-            "trigger_counts":       self._observation_trigger_counts,
-            "last_updated":         datetime.now(timezone.utc).isoformat(),
-        }
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # Persist only new initiatives via db.add_initiative_record; internal counters remain in memory
+        pass
 
     # ── Core logic ────────────────────────────────────────────────────────────
     def update(self, user_input: str, chisato_response: str) -> None:
@@ -210,7 +208,11 @@ class InitiativeSystem:
         )
         self.history.append(record)
         self.turns_since_initiative = 0
-        self._save()
+        self.db.add_initiative_record(
+            initiative_type=initiative_type,
+            content=content,
+            turn_taken=self.turn_counter,
+        )
 
     # ── Initiative generation ─────────────────────────────────────────────────
     def _get_curiosity(self, user_input: str) -> Optional[str]:

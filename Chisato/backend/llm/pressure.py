@@ -14,12 +14,11 @@ The other is the climate of the relationship.
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from memory.db import get_db
 
 # ── Pressure meter definitions ────────────────────────────────────────────────
 
@@ -115,8 +114,10 @@ class FrustrationEvent:
 
 
 class PressureSystem:
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, path=None) -> None:
+        # path kept for backward compatibility; storage is now SQLite via ChisatoDB
+        self.path = path
+        self.db = get_db()
         self.meters: Dict[str, PressureMeter] = {}
         self.frustration_events: List[FrustrationEvent] = []
         self.turn_count: int = 0
@@ -127,43 +128,47 @@ class PressureSystem:
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def _load(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
+        # Meters come from pressure_meters table
+        db_meters = self.db.get_pressure_meters()
+        if db_meters:
+            self.meters = {}
+            for name, row in db_meters.items():
+                self.meters[name] = PressureMeter(
+                    value=row["value"],
+                    floor=row["floor"],
+                    ceiling=row["ceiling"],
+                    decay_rate=row["decay_rate"],
+                    neutral=row["neutral"],
+                )
+        else:
+            # Seed defaults into DB on first load
             self.meters = {
                 k: PressureMeter(**vars(v))
                 for k, v in DEFAULT_METERS.items()
             }
-            self.frustration_events = []
-            self._save()
-        else:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            # Restore meters
-            saved_meters = data.get("meters", {})
-            self.meters = {}
-            for key, defaults in DEFAULT_METERS.items():
-                if key in saved_meters:
-                    self.meters[key] = PressureMeter(**saved_meters[key])
-                else:
-                    self.meters[key] = PressureMeter(**vars(defaults))
-            # Restore frustration events
-            raw_events = data.get("frustration_events", [])
-            self.frustration_events = [
-                FrustrationEvent(**e) for e in raw_events
-            ]
-            self._frustration_satisfaction_progress = data.get(
-                "satisfaction_progress", 0.0
+            self.db.save_all_pressure_meters(
+                {name: meter.value for name, meter in self.meters.items()}
             )
 
+        # Frustration events come from frustration_events table
+        events = self.db.get_unresolved_frustration_events()
+        self.frustration_events = [
+            FrustrationEvent(
+                cause=e["cause"],
+                severity=e["severity"],
+                resolved=bool(e["resolved"]),
+                timestamp=e["timestamp"],
+            )
+            for e in events
+        ]
+        # Satisfaction progress becomes a transient in-memory value only
+        self._frustration_satisfaction_progress = 0.0
+
     def _save(self) -> None:
-        data = {
-            "meters": {k: vars(v) for k, v in self.meters.items()},
-            "frustration_events": [vars(e) for e in self.frustration_events],
-            "satisfaction_progress": self._frustration_satisfaction_progress,
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-        }
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # Persist current meter values
+        self.db.save_all_pressure_meters(
+            {name: meter.value for name, meter in self.meters.items()}
+        )
 
     # ── Meter access ──────────────────────────────────────────────────────────
     def get(self, meter: str) -> float:

@@ -25,30 +25,32 @@ def record_microphone(
     tmp = Path(tempfile.mkstemp(suffix=".wav")[1])
     try:
         import sounddevice as sd  # type: ignore
-        import numpy as np  # type: ignore
 
         frames = int(duration_sec * sample_rate)
         audio = sd.rec(frames, samplerate=sample_rate, channels=channels, dtype="int16")
         sd.wait()
-        data = audio.flatten().tolist()
+        data = audio.flatten().tobytes()
     except Exception:
         # Fallback: generate silence so the rest of the pipeline still runs.
         import array
 
-        data = array.array("h", [0] * int(duration_sec * sample_rate * channels))
+        silence = array.array("h", [0] * int(duration_sec * sample_rate * channels))
+        data = silence.tobytes()
 
     with wave.open(str(tmp), "wb") as wf:
         wf.setnchannels(channels)
         wf.setsampwidth(2)  # 16-bit
         wf.setframerate(sample_rate)
-        wf.writeframes(bytes(data))
+        wf.writeframes(data)
     return tmp
 
 
-def transcribe_with_whisper(audio_path: Path, api_url: str = "http://localhost:9000") -> Optional[str]:
+def transcribe_with_whisper(
+    audio_path: Path,
+    api_url: str = "http://localhost:9000/transcribe",
+) -> Optional[str]:
     """
-    Send an audio file to a Whisper server and return its text.
-    Replace this stub with your actual Whisper client (e.g., faster-whisper, openai/whisper, etc.).
+    Send an audio file to the Faster-Whisper HTTP server and return its text.
     """
     try:
         import requests  # type: ignore
@@ -66,7 +68,10 @@ def transcribe_with_whisper(audio_path: Path, api_url: str = "http://localhost:9
         return None
 
 
-def transcribe(duration_sec: int = 5, whisper_url: str = "http://localhost:9000") -> Optional[str]:
+def transcribe(
+    duration_sec: int = 5,
+    whisper_url: str = "http://localhost:9000/transcribe",
+) -> Optional[str]:
     """
     Convenience helper: record audio, send to Whisper, and return text.
     """

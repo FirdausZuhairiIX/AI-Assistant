@@ -22,13 +22,12 @@ Three mechanisms:
 """
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from memory.db import get_db
 
 # ── Character Anchor ──────────────────────────────────────────────────────────
 # This is the densest, most essential description of Chisato.
@@ -143,8 +142,10 @@ class DriftRecord:
 
 
 class ConsistencyEngine:
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, path=None) -> None:
+        # path kept for backward compatibility; storage is now SQLite via ChisatoDB
+        self.path = path
+        self.db = get_db()
         self.recent_responses: List[str] = []
         self.drift_history: List[DriftRecord] = []
         self.total_validated: int = 0
@@ -155,31 +156,22 @@ class ConsistencyEngine:
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def _load(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            self._save()
-            return
-        with self.path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.recent_responses  = data.get("recent_responses", [])
-        self.drift_history     = [DriftRecord(**d) for d in data.get("drift_history", [])]
-        self.total_validated   = data.get("total_validated", 0)
-        self.total_hard_breaks = data.get("total_hard_breaks", 0)
-        self.total_soft_breaks = data.get("total_soft_breaks", 0)
-        self.consecutive_clean = data.get("consecutive_clean", 0)
+        stats = self.db.get_consistency_stats()
+        if stats:
+            self.total_validated = stats.get("total_validated", 0)
+            self.total_hard_breaks = stats.get("total_hard_breaks", 0)
+            self.total_soft_breaks = stats.get("total_soft_breaks", 0)
+            self.consecutive_clean = stats.get("consecutive_clean", 0)
+        self.recent_responses = []
+        self.drift_history = []
 
     def _save(self) -> None:
-        data = {
-            "recent_responses":  self.recent_responses[-20:],
-            "drift_history":     [vars(d) for d in self.drift_history[-50:]],
-            "total_validated":   self.total_validated,
-            "total_hard_breaks": self.total_hard_breaks,
-            "total_soft_breaks": self.total_soft_breaks,
-            "consecutive_clean": self.consecutive_clean,
-            "last_updated":      datetime.now(timezone.utc).isoformat(),
-        }
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        self.db.save_consistency_stats(
+            total_validated=self.total_validated,
+            total_hard_breaks=self.total_hard_breaks,
+            total_soft_breaks=self.total_soft_breaks,
+            consecutive_clean=self.consecutive_clean,
+        )
 
     # ── Validation ────────────────────────────────────────────────────────────
     def validate(self, response: str) -> ValidationResult:
